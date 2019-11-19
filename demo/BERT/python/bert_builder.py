@@ -208,6 +208,9 @@ def bert_model(config, init_dict, network, input_tensor, input_mask):
 def squad_output(prefix, config, init_dict, network, input_tensor):
     """
     Create the squad output
+
+    input_tensor is the last encoder layer output
+
     """
 
     idims = input_tensor.shape
@@ -217,9 +220,53 @@ def squad_output(prefix, config, init_dict, network, input_tensor):
     W_out = init_dict[prefix + SQD_W]
     B_out = init_dict[prefix + SQD_B]
 
+    # 2 is the number of labels
+
+    # 1, H, 2
     W = network.add_constant((1, hidden_size, 2), W_out)
+    # B, S, 2 = B, S, H * 1, H, 2 + 2
     dense = network.add_fully_connected(input_tensor, 2, W_out, B_out)
+
     set_layer_name(dense, prefix, "dense")
+    return dense
+
+
+def classifier_output(prefix, config, init_dict, network, input_tensor):
+    """
+    Create the classifier output
+
+    input_tensor is the last encoder layer logits output
+
+    """
+
+    idims = input_tensor.shape
+    assert len(idims) == 5
+    B, S, hidden_size, _, _ = idims
+
+    W_pool_out = init_dict["bert_pooler_dense_bias"]
+    B_pool_out = init_dict["bert_pooler_dense_kernel"]
+    
+    # B, H
+    first_token_slice = network.add_slice(input_tensor, (0,0,0), (B, hidden_size), (0,S,0))
+    # add slice to network
+    first_token_tensor = network.add_constant((B, hidden_size), first_token_slice)
+    # H, H
+    W_pool = network.add_constant((hidden_size, hidden_size), W_pool_out)
+    # B, H = B, H * H, H + H
+    dense = network.add_fully_connected(first_token_tensor, 1, W_pool_out, B_pool_out)
+    # B, H
+    pooled_output = network.add_activation(dense, "TANH")
+
+    # H, num_labels
+    W_out = init_dict["output_weights"]
+    B_out = init_dict["output_bias"]
+    num_labels = 2
+    
+    W = network.add_constant((1, hidden_size, num_labels), W_out)
+    # B, num_labels = B, H * 1, H, num_labels + num_labels
+    dense = network.add_fully_connected(pooled_output, 1, W_out, B_out)
+
+    set_layer_name(dense, prefix, "prob")
     return dense
 
 
@@ -234,7 +281,7 @@ def load_weights(inputbase):
         tensor_dict = reader.get_variable_to_shape_map()
 
         # There might be training-related variables in the checkpoint that can be discarded
-        param_names = [key for key in sorted(tensor_dict) if 'adam' not in key and 'global_step' not in key and 'pooler' not in key]
+        param_names = [key for key in sorted(tensor_dict) if 'adam' not in key and 'global_step' not in key]
         count = len(param_names)
         TRT_LOGGER.log(TRT_LOGGER.INFO, "Found {:} entries in weight map".format(count))
 
@@ -335,24 +382,26 @@ def main(inputbase, B, S, bert_path, outputbase):
             input_mask = network.add_input(name="input_mask", dtype=trt.int32, shape=(-1, S))
 
             def set_profile_shape(profile, batch_size):
-                shape = (batch_size, S)
-                profile.set_shape("input_ids", min=shape, opt=shape, max=shape)
-                profile.set_shape("segment_ids", min=shape, opt=shape, max=shape)
-                profile.set_shape("input_mask", min=shape, opt=shape, max=shape)
+                min_shape = (1, S)
+                opt_shape = (batch_size, S)
+                max_shape = (batch_size * 2, S)
+                profile.set_shape("input_ids", min=min_shape, opt=opt_shape, max=max_shape)
+                profile.set_shape("segment_ids", min=min_shape, opt=opt_shape, max=max_shape)
+                profile.set_shape("input_mask", min=min_shape, opt=opt_shape, max=max_shape)
 
             # Specify profiles for the batch sizes we're interested in.
             # For maximum performance, we will tie each profile to exactly one shape rather than a range.
-            bs1_profile = builder.create_optimization_profile()
-            set_profile_shape(bs1_profile, 1)
-            builder_config.add_optimization_profile(bs1_profile)
+            # bs1_profile = builder.create_optimization_profile()
+            # set_profile_shape(bs1_profile, 1)
+            # builder_config.add_optimization_profile(bs1_profile)
 
             bs_user_profile = builder.create_optimization_profile()
             set_profile_shape(bs_user_profile, B)
             builder_config.add_optimization_profile(bs_user_profile)
 
-            bs8_profile = builder.create_optimization_profile()
-            set_profile_shape(bs8_profile, 8)
-            builder_config.add_optimization_profile(bs8_profile)
+            # bs8_profile = builder.create_optimization_profile()
+            # set_profile_shape(bs8_profile, 8)
+            # builder_config.add_optimization_profile(bs8_profile)
 
             # Create the network
             inputs = [input_ids, segment_ids, input_mask]
